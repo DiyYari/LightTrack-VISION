@@ -1,141 +1,223 @@
+/*
+ *	An Arduino library for the Hi-Link LD2450 24Ghz FMCW radar sensor.
+ *
+ *  This sensor is a Frequency Modulated Continuous Wave radar, which makes it good for presence detection and its sensitivity at different ranges to both static and moving targets can be configured.
+ *
+ *	The code in this library is based off the https://github.com/0ingchun/arduino-lib_HLK-LD2450_Radar.
+ *
+ *	https://github.com/ncmreynolds/ld2410
+ *
+ *
+ */
+#ifndef LD2450_cpp
+#define LD2450_cpp
+
 #include "LD2450.h"
 
-#include <math.h>
-#include <string.h>
-
-namespace {
-constexpr uint8_t kFrameHeader[] = {0xFD, 0xFC, 0xFB, 0xFA};
+LD2450::LD2450() // Constructor function
+{
 }
 
-LD2450::LD2450() : serial_(nullptr), buffer_{0}, bufferLength_(0) { resetTargets(); }
-
-void LD2450::begin(Stream& serial) {
-  serial_ = &serial;
-  resetTargets();
-  bufferLength_ = 0;
+LD2450::~LD2450() // Destructor function
+{
 }
 
-LD2450::RadarTarget LD2450::getTarget(size_t index) const {
-  if (index >= kSupportedTargets) {
-    return RadarTarget{};
-  }
-  return targets_[index];
+
+void LD2450::begin(Stream &radarStream)
+{
+    LD2450::radar_uart = &radarStream;
+    LD2450::last_target_data = "";
 }
 
-void LD2450::resetTargets() {
-  for (auto& target : targets_) {
-    target = RadarTarget{};
-  }
-}
-
-void LD2450::shiftBuffer(size_t count) {
-  if (count == 0 || count > bufferLength_) return;
-  const size_t remaining = bufferLength_ - count;
-  if (remaining > 0) {
-    memmove(buffer_, buffer_ + count, remaining);
-  }
-  bufferLength_ = remaining;
-}
-
-size_t LD2450::findHeaderIndex() const {
-  if (bufferLength_ < sizeof(kFrameHeader)) return SIZE_MAX;
-  for (size_t i = 0; i <= bufferLength_ - sizeof(kFrameHeader); ++i) {
-    bool match = true;
-    for (size_t j = 0; j < sizeof(kFrameHeader); ++j) {
-      if (buffer_[i + j] != kFrameHeader[j]) {
-        match = false;
-        break;
-      }
-    }
-    if (match) return i;
-  }
-  return SIZE_MAX;
-}
-
-size_t LD2450::expectedFrameSize() const {
-  if (bufferLength_ < sizeof(kFrameHeader) + 2) return 0;
-  const uint16_t payloadLength = buffer_[4] | (static_cast<uint16_t>(buffer_[5]) << 8);
-  // Guard against unrealistic payload sizes to avoid buffer overflow.
-  if (payloadLength > kFrameBufferSize - 6) return 0;
-  return static_cast<size_t>(payloadLength) + 6;  // header + length fields
-}
-
-bool LD2450::decodeFrame(const uint8_t* frame, size_t length) {
-  if (length < sizeof(kFrameHeader) + 2) return false;
-  const uint16_t payloadLength = frame[4] | (static_cast<uint16_t>(frame[5]) << 8);
-  const size_t expectedLength = static_cast<size_t>(payloadLength) + 6;
-  if (length < expectedLength) return false;
-
-  const size_t payloadStart = 6;
-  const size_t payloadAvailable = length > payloadStart ? length - payloadStart : 0;
-
-  size_t validCount = 0;
-  for (size_t i = 0; i < kSupportedTargets; ++i) {
-    const size_t base = payloadStart + i * 6;
-    if (base + 6 > payloadStart + payloadAvailable) {
-      targets_[i] = RadarTarget{};
-      continue;
+void LD2450::begin(HardwareSerial &radarStream, bool already_initialized)
+{
+    if (!already_initialized)
+    {
+        radarStream.begin(LD2450_SERIAL_SPEED);
+        radarStream.setTimeout(10);
     }
 
-    const int16_t x = static_cast<int16_t>(frame[base] | (frame[base + 1] << 8));
-    const int16_t y = static_cast<int16_t>(frame[base + 2] | (frame[base + 3] << 8));
-    const int16_t speed = static_cast<int16_t>(frame[base + 4] | (frame[base + 5] << 8));
+    LD2450::radar_uart = &radarStream;
 
-    RadarTarget target;
-    target.x = x;
-    target.y = y;
-    target.speed = speed;
-    target.distance = static_cast<int>(roundf(sqrtf(static_cast<float>(x) * static_cast<float>(x) +
-                                                   static_cast<float>(y) * static_cast<float>(y))));
-    target.valid = !(x == 0 && y == 0 && speed == 0);
-
-    targets_[i] = target;
-    if (target.valid) ++validCount;
-  }
-
-  // If the payload includes fewer than the expected bytes for three targets, consider it invalid.
-  const size_t minimumPayloadBytes = kSupportedTargets * 6;
-  return payloadAvailable >= minimumPayloadBytes && validCount > 0;
+    LD2450::last_target_data = "";
 }
 
-size_t LD2450::read() {
-  if (serial_ == nullptr) return 0;
-
-  while (serial_->available() && bufferLength_ < kFrameBufferSize) {
-    buffer_[bufferLength_++] = static_cast<uint8_t>(serial_->read());
-  }
-
-  size_t lastValidCount = 0;
-
-  while (true) {
-    const size_t headerIndex = findHeaderIndex();
-    if (headerIndex == SIZE_MAX) {
-      bufferLength_ = 0;  // no header found, drop buffer
-      break;
+#ifdef ENABLE_SOFTWARESERIAL_SUPPORT
+    void LD2450::begin(SoftwareSerial &radarStream, bool already_initialized)
+    {
+        if (!already_initialized)
+        {
+            radarStream.begin(LD2450_SERIAL_SPEED);
+            radarStream.setTimeout(10);
+        }
+    
+        LD2450::radar_uart = &radarStream;
+    
+        LD2450::last_target_data = "";
     }
-    if (headerIndex > 0) {
-      shiftBuffer(headerIndex);
-      continue;
-    }
+#endif
 
-    const size_t frameSize = expectedFrameSize();
-    if (frameSize == 0) {
-      // Invalid length detected, drop one byte and resync.
-      shiftBuffer(1);
-      continue;
-    }
-    if (frameSize > bufferLength_) break;  // wait for more data
 
-    if (decodeFrame(buffer_, frameSize)) {
-      size_t validTargets = 0;
-      for (const auto& target : targets_) {
-        if (target.valid) ++validTargets;
-      }
-      lastValidCount = validTargets;
+void LD2450::setNumberOfTargets(uint16_t _numTargets)
+{
+    if (_numTargets > LD2450_MAX_SENSOR_TARGETS)
+    {
+        _numTargets = LD2450_MAX_SENSOR_TARGETS;
     }
 
-    shiftBuffer(frameSize);
-  }
-
-  return lastValidCount;
+    LD2450::numTargets = _numTargets;
 }
+
+String LD2450::getLastTargetMessage()
+{
+    return LD2450::last_target_data;
+}
+
+
+bool LD2450::waitForSensorMessage(bool wait_forever){
+
+    uint8_t read_result = 0;
+    for(long i = 0; i < LD2450_DEFAULT_RETRY_COUNT_FOR_WAIT_FOR_MSG; i++){
+        read_result = LD2450::read();
+        if(read_result >= 0){
+            return true;
+        }
+        delay(1);
+        
+        //.... :)
+        if(wait_forever){
+            i = 0;
+        }
+    }
+    return false;
+}
+
+
+
+int LD2450::read()
+{
+    if (LD2450::radar_uart == nullptr)
+    {
+        return -2;
+    }
+
+    if (LD2450::radar_uart->available())
+    {   
+        
+        byte rec_buf[LD2450_SERIAL_BUFFER] = "";
+        const int len = LD2450::radar_uart->readBytes(rec_buf, sizeof(rec_buf));
+        // IF WE GOT DATA PARSE THEM
+        if (len > 0)
+        {
+            return LD2450::ProcessSerialDataIntoRadarData(rec_buf, len);
+        }
+    }
+    return -1;
+}
+
+uint16_t LD2450::getSensorSupportedTargetCount(){
+    if(LD2450::numTargets < LD2450_MAX_SENSOR_TARGETS){
+        return LD2450::numTargets;
+    }
+    
+    return LD2450_MAX_SENSOR_TARGETS;
+}
+
+LD2450::RadarTarget LD2450::getTarget(uint16_t _target_id){
+    if (_target_id >= LD2450_MAX_SENSOR_TARGETS){
+        LD2450::RadarTarget tmp;
+        tmp.valid = false;
+        return tmp;
+    }
+    return LD2450::radarTargets[_target_id];
+}
+int LD2450::ProcessSerialDataIntoRadarData(byte rec_buf[], int len)
+{
+    int redreshed_targets = 0;
+
+    for (int i = 0; i < len; i++)
+    {
+        // Checking the header and footer
+        if (rec_buf[i] == 0xAA && rec_buf[i + 1] == 0xFF && rec_buf[i + 2] == 0x03 && rec_buf[i + 3] == 0x00 && rec_buf[i + 28] == 0x55 && rec_buf[i + 29] == 0xCC)
+        {
+
+            int index = i + 4; // Skip header and in-frame data length fields
+            LD2450::last_target_data = "";
+
+            for (uint16_t targetCounter = 0; targetCounter < LD2450_MAX_SENSOR_TARGETS; targetCounter++)
+            {
+
+                
+                
+                if (index + 7 < len)
+                {
+                    LD2450::RadarTarget target;
+                    target.x = (int16_t)(rec_buf[index] | (rec_buf[index + 1] << 8));
+                    target.y = (int16_t)(rec_buf[index + 2] | (rec_buf[index + 3] << 8));
+                    target.speed = (int16_t)(rec_buf[index + 4] | (rec_buf[index + 5] << 8));
+                    target.resolution = (uint16_t)(rec_buf[index + 6] | (rec_buf[index + 7] << 8));
+
+                    // debug_serial.println(target.x);
+                    // debug_serial.println(target.y);
+                    // debug_serial.println(target.speed);
+
+                    // Check the highest bit of x and y. Adjust the sign
+                    if (rec_buf[index + 1] & 0x80)
+                        target.x -= 0x8000;
+                    else
+                        target.x = -target.x;
+                    if (rec_buf[index + 3] & 0x80)
+                        target.y -= 0x8000;
+                    else
+                        target.y = -target.y;
+                    if (rec_buf[index + 5] & 0x80)
+                        target.speed -= 0x8000;
+                    else
+                        target.speed = -target.speed;
+
+
+                    //CALCULATE DISTANCE
+                    target.distance = sqrt(pow(target.x, 2) +  pow(target.y, 2));
+
+                    // IF A RESOLUTION IS PRESENT THEN WE CAN ASSUME THAT A TARGET WAS FOUND
+                    if(target.resolution != 0){
+                        target.valid = true;
+                    }else{
+                       target.valid = false;
+                    }
+
+
+                    LD2450::radarTargets[targetCounter].id = targetCounter + 1;
+                    LD2450::radarTargets[targetCounter].x = target.x;
+                    LD2450::radarTargets[targetCounter].y = target.y;
+                    LD2450::radarTargets[targetCounter].speed = target.speed;
+                    LD2450::radarTargets[targetCounter].resolution = target.resolution;
+                    LD2450::radarTargets[targetCounter].valid = target.valid;
+                    LD2450::radarTargets[targetCounter].distance = target.distance;
+                    
+
+                    // Add target information to the string
+                    LD2450::last_target_data += "TARGET ID=" + String(targetCounter + 1) + " X=" + String(target.x) + "mm, Y=" + String(target.y) + "mm, SPEED=" + String(target.speed) + "cm/s, RESOLUTION=" + String(target.resolution) + "mm, DISTANCE=" + String(target.distance) + "mm, VALID=" + String(target.valid) + "\n";
+
+                    index += 8; // Move to the start of the next target data
+
+                    redreshed_targets++;
+
+                    //SKIP IF USER ONLY REQUESTED X VALID TARGETS
+                    if(redreshed_targets >= LD2450::numTargets){
+                        break;
+                    }
+                }else{
+                    LD2450::radarTargets[targetCounter].valid = false;
+                }
+                
+
+
+            }
+            i = index; // Updating the index of an external loop
+        }
+    }
+    return redreshed_targets;
+}
+
+#endif
